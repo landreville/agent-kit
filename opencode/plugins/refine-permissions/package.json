@@ -1,0 +1,11 @@
+{
+  "name": "refine-permissions",
+  "version": "0.1.0",
+  "description": "OpenCode v2 plugin: refine-permissions skill proposes safer shell allowlist rules from session history",
+  "type": "module",
+  "main": "index.js",
+  "private": true,
+  "scripts": {
+    "test": "node --test"
+  }
+}

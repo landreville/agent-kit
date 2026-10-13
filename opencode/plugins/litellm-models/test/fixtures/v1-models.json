@@ -1,0 +1,11 @@
+{
+  "object": "list",
+  "data": [
+    { "id": "claude-sonnet-5", "object": "model", "created": 1677610602, "owned_by": "openai", "mode": "chat", "max_input_tokens": 1000000, "max_output_tokens": 128000 },
+    { "id": "Qwen/Qwen3.8-Max", "object": "model", "created": 1677610602, "owned_by": "openai" },
+    { "id": "kimi-k3", "object": "model", "created": 1677610602, "owned_by": "openai" },
+    { "id": "glm-5.3", "object": "model", "created": 1677610602, "owned_by": "openai", "mode": "chat", "max_input_tokens": 128000, "max_output_tokens": 16384 },
+    { "id": "glm-5.3", "object": "model", "created": 1677610602, "owned_by": "openai", "mode": "chat", "max_input_tokens": 999, "max_output_tokens": 999 },
+    { "id": "text-embedding-large", "object": "model", "created": 1677610602, "owned_by": "openai", "mode": "embedding" }
+  ]
+}

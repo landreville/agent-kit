@@ -1,0 +1,95 @@
+{
+  "data": [
+    {
+      "model_name": "claude-sonnet-5",
+      "litellm_params": { "model": "openai/claude-sonnet-5" },
+      "model_info": {
+        "max_input_tokens": null,
+        "max_output_tokens": null,
+        "input_cost_per_token": 0,
+        "output_cost_per_token": 0,
+        "cache_read_input_token_cost": 2e-7,
+        "cache_creation_input_token_cost": 2.5e-6,
+        "mode": null,
+        "supported_openai_params": ["reasoning_effort"]
+      }
+    },
+    {
+      "model_name": "gpt-5.6-sol",
+      "litellm_params": { "model": "openai/gpt-5.6-sol" },
+      "model_info": {
+        "max_input_tokens": 922000,
+        "max_output_tokens": 128000,
+        "input_cost_per_token": 4e-6,
+        "output_cost_per_token": 2e-5,
+        "cache_read_input_token_cost": 4e-7,
+        "cache_creation_input_token_cost": 5e-6,
+        "mode": "chat"
+      }
+    },
+    {
+      "model_name": "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+      "litellm_params": { "model": "deepinfra/meta-llama/Llama-3.3-70B-Instruct-Turbo" },
+      "model_info": {
+        "max_input_tokens": 131072,
+        "max_output_tokens": 131072,
+        "input_cost_per_token": 1e-7,
+        "output_cost_per_token": 3.2e-7,
+        "cache_read_input_token_cost": null,
+        "cache_creation_input_token_cost": null,
+        "mode": "chat"
+      }
+    },
+    {
+      "model_name": "glm-5.3",
+      "litellm_params": { "model": "openai/glm-5.3", "api_base": "https://route-a.example/v1" },
+      "model_info": {
+        "max_input_tokens": null,
+        "max_output_tokens": null,
+        "input_cost_per_token": 0,
+        "output_cost_per_token": 0,
+        "mode": null
+      }
+    },
+    {
+      "model_name": "glm-5.3",
+      "litellm_params": { "model": "openai/glm-5.3", "api_base": "https://route-b.example/v1" },
+      "model_info": {
+        "max_input_tokens": 65536,
+        "max_output_tokens": 8192,
+        "input_cost_per_token": 5e-7,
+        "output_cost_per_token": 1.5e-6,
+        "mode": null
+      }
+    },
+    {
+      "model_name": "Qwen/Qwen3.8-Max",
+      "litellm_params": { "model": "deepinfra/Qwen/Qwen3.8-Max" },
+      "model_info": {
+        "max_input_tokens": 256000,
+        "max_output_tokens": null,
+        "input_cost_per_token": 1.65e-6,
+        "output_cost_per_token": 4.951e-6,
+        "cache_read_input_token_cost": 2.06e-7,
+        "cache_creation_input_token_cost": null,
+        "mode": "chat"
+      }
+    },
+    {
+      "model_name": "sparse-model",
+      "litellm_params": { "model": "sparse/sparse-model" },
+      "model_info": { "mode": null }
+    },
+    {
+      "model_name": "text-embedding-small",
+      "litellm_params": { "model": "openai/text-embedding-small" },
+      "model_info": {
+        "max_input_tokens": 8192,
+        "max_output_tokens": 0,
+        "input_cost_per_token": 1e-8,
+        "output_cost_per_token": 0,
+        "mode": "embedding"
+      }
+    }
+  ]
+}

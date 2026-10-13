@@ -1,0 +1,8 @@
+{
+  "name": "sbx-reorder-probe",
+  "version": "0.1.0",
+  "description": "Throwaway OpenCode v2 probe plugin (sandbox-reorder Task 1): verifies prediction inputs, evaluate resource shape, and first-call input mutation",
+  "type": "module",
+  "main": "index.js",
+  "private": true
+}

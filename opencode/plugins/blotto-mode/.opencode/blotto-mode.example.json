@@ -1,0 +1,43 @@
+{
+  "enabled": true,
+  "kinds": ["bash", "webfetch", "websearch", "external_directory", "edit", "mcp"],
+  "judge": {
+    "baseUrl": "https://litellm.example.com/v1",
+    "apiKey": "{env:LITELLM_API_KEY}",
+    "model": "glm-5.3-flash",
+    "fallbackModel": null,
+    "timeoutMs": 8000,
+    "userMessageCount": 6,
+    "contextTokenBudget": 1500
+  },
+  "laya": {
+    "mode": "shadow",
+    "baseUrl": null,
+    "apiKey": null,
+    "timeoutMs": 150,
+    "verdictThreshold": 0.95,
+    "allowDeny": false,
+    "questions": [],
+    "disableQuestions": []
+  },
+  "rules": { "disable": [], "custom": [] },
+  "cache": { "sessionPatterns": true },
+  "feedback": { "injectDenialReason": true, "toast": true },
+  "log": { "path": "~/.local/share/blotto-mode/decisions.jsonl", "maxMb": 50 },
+  "$examples": {
+    "rule": {
+      "id": "terraform-apply",
+      "kinds": ["bash"],
+      "reason": "infrastructure changes need a human",
+      "match": { "command": "terraform", "subcommand": "apply" }
+    },
+    "layaQuestion": {
+      "id": "touches_prod",
+      "type": "noul",
+      "role": "veto",
+      "threshold": 0.8,
+      "instructions": "Does the action touch a production host, database, or deployment?",
+      "criteria": { "true": "targets production systems", "false": "local or development only" }
+    }
+  }
+}

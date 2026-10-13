@@ -1,0 +1,11 @@
+{
+  "name": "litellm-models",
+  "version": "0.1.0",
+  "description": "OpenCode v1 (>=1.17.7) and v2 plugin: populate the litellm provider's model list from the LiteLLM gateway",
+  "type": "module",
+  "main": "index.js",
+  "private": true,
+  "scripts": {
+    "test": "node --test"
+  }
+}

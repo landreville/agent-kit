@@ -1,0 +1,7 @@
+node_modules/
+.worktrees/
+*.log
+
+# blotto-mode eval CLI output (bin/eval.ts writes eval/runs/ relative to cwd)
+eval/runs/
+

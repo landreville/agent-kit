@@ -1,0 +1,24 @@
+{
+  "name": "blotto-mode",
+  "version": "0.1.0",
+  "description": "Auto mode for OpenCode v2: intent-aware permission auto-resolution",
+  "type": "module",
+  "main": "src/index.ts",
+  "license": "MIT",
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "bunx tsc --noEmit",
+    "report": "bun run bin/report.ts",
+    "eval": "bun run bin/eval.ts"
+  },
+  "dependencies": {
+    "@opencode-ai/plugin": "1.18.34",
+    "@opencode-ai/sdk": "1.18.34",
+    "bash-parser": "0.5.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.6.0"
+  }
+}
