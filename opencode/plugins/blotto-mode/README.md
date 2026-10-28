@@ -1,6 +1,6 @@
 # blotto-mode
 
-Auto mode for OpenCode v2. A plugin that answers permission requests on the user's behalf: obviously dangerous actions are denied by hard rules, repeats are served from a session cache, and everything else is judged against what the user actually asked for. Anything undecided, or any failure, falls back to OpenCode's normal prompt. It lives in the agent-kit repo at `opencode/plugins/blotto-mode/`.
+Auto mode for OpenCode v2. A plugin that answers permission requests on the user's behalf: obviously dangerous actions are denied by hard rules, repeats are served from a session cache, and everything else is judged against what the user actually asked for. Anything undecided, or any failure, falls back to OpenCode's normal prompt. It lives in the agent-kit repo at `opencode/plugins/blotto-mode/`; its spec and plan are under `docs/superpowers/` at that repo's root.
 
 It is **not a sandbox** (see [Safety notes](#safety-notes)).
 
@@ -59,7 +59,7 @@ Configure the judge:
 { "judge": { "apiKey": "{env:LITELLM_API_KEY}" } }
 ```
 
-`LITELLM_API_KEY` must be exported in the shell that launches OpenCode, or written literally into the file. An unset `{env:VAR}` expands to an empty string with no warning. See [docs/install.md](docs/install.md) for the manual acceptance checklist.
+`LITELLM_API_KEY` may be exported in the shell that launches OpenCode, written literally into the file, or — when running under OpenCode v2 — resolved automatically from `~/.local/share/opencode/auth.json`. The store lookup (`src/v2.ts`, `resolveAuthApiKey`) prefers the canonical `litellm` entry, then any entry whose id starts with `litellm` (so a dedicated key named e.g. `litellm-blottomode` works); credentials of other providers are never borrowed. Set `"judge": { "authProvider": "<id>" }` to name an exact entry. An unset `{env:VAR}` expands to an empty string, so prefer the auth store or a literal value. See [docs/install.md](docs/install.md) for the manual acceptance checklist.
 
 ## Configuration
 
@@ -74,6 +74,7 @@ Config layers, later wins: built-in defaults, `~/.config/opencode/blotto-mode.js
 | `judge.model` | `glm-5.3-flash` | Judge model. |
 | `judge.fallbackModel` | `null` | Model to try if the primary fails. |
 | `judge.timeoutMs` | `8000` | Judge timeout (100-60000). |
+| `judge.maxTokens` | `2000` | Judge completion budget (50-64000). Reasoning judges (e.g. GLM-family models) spend part of it on `reasoning_content` before the JSON verdict; the old hardcoded 200 starved them to empty content, so raising this above the reasoning length is required for such models. |
 | `judge.userMessageCount` | `6` | Recent user messages shown to the judge (1-20). |
 | `judge.contextTokenBudget` | `1500` | Token budget for session context (200-20000). |
 | `laya.mode` | `"shadow"` | `off`, `shadow` (run and log, never decide), or `active`. |
@@ -153,6 +154,24 @@ The agent can call `blotto_mode` with `action`:
 - `status`: enabled state, judge model, Laya mode and reachability, and this session's allowed/denied/asked counts by tier.
 - `off`: disable blotto-mode for this session only (prompts appear normally).
 - `on`: re-enable for this session. Refused when disabled globally.
+- `laya_install`: check PATH for `laya-serve`, probe `laya.baseUrl` if set (default port 8000), and refresh the cached reachability flag. Prints install/run guidance; never auto-installs (no sudo).
+
+Installing Laya (optional fast tier): Laya is an open-source typed-decision model. With an NVIDIA GPU (e.g. RTX 3080) or CPU:
+
+```
+python3 -m venv ~/.local/share/laya-venv
+~/.local/share/laya-venv/bin/pip install 'laya[serve]'
+ln -s ~/.local/share/laya-venv/bin/laya-serve ~/.local/bin/laya-serve
+LAYA_DEVICE=cuda LAYA_PRELOAD=1 laya-serve          # binds 0.0.0.0:8000
+```
+
+Then set in `~/.config/opencode/blotto-mode.json`:
+
+```json
+"laya": { "mode": "shadow", "baseUrl": "http://127.0.0.1:8000", "apiKey": null }
+```
+
+If `LAYA_API_KEY` is set on the server, put the same value in `laya.apiKey`. The endpoint is `POST /v1/systemone`. Run `blotto_mode laya_install` to verify reachability.
 
 It cannot change persistent configuration.
 

@@ -75,6 +75,12 @@ test("isSrtInvocation catches direct and chained srt calls", () => {
   assert.equal(isSrtInvocation("srt"), true)
   assert.equal(isSrtInvocation("npm test"), false)
   assert.equal(isSrtInvocation("echo srt -- npm test"), false)
+  // Per faithful segment: newline-separated commands are separate segments.
+  assert.equal(isSrtInvocation("cd x && srt npm test"), true)
+  assert.equal(isSrtInvocation("set -e\nsrt -- make"), true)
+  assert.equal(isSrtInvocation("set -e\nmake"), false)
+  // Quoted content can never be a segment's first token: no decoy runs.
+  assert.equal(isSrtInvocation('git commit -m "srt"'), false)
 })
 
 test("matchesExcludedCommand: trailing star is boundary prefix (bare + args), else exact", () => {
@@ -84,4 +90,11 @@ test("matchesExcludedCommand: trailing star is boundary prefix (bare + args), el
   assert.equal(matchesExcludedCommand("npmx", ["npm *"]), false)
   assert.equal(matchesExcludedCommand("docker ps", ["docker compose *"]), false)
   assert.equal(matchesExcludedCommand("docker", ["docker"]), true)
+  // Per faithful segment: a later real segment matching excludes too.
+  assert.equal(matchesExcludedCommand("docker compose up && ls", ["docker compose *"]), true)
+  assert.equal(matchesExcludedCommand("ls && docker compose up", ["docker compose *"]), true)
+  // Quoted content inside a segment's args is not a segment: no match.
+  assert.equal(matchesExcludedCommand('echo "docker compose"', ["docker compose *"]), false)
+  // Whole-command exclusion still works for simple commands.
+  assert.equal(matchesExcludedCommand("docker compose up", ["docker compose *"]), true)
 })

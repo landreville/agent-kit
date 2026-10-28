@@ -72,7 +72,7 @@
 import { randomBytes } from "node:crypto"
 import { dirname } from "node:path"
 import { fileURLToPath } from "node:url"
-import { resolveOptions, buildCustomConfig } from "./config.js"
+import { resolveOptions, buildCustomConfig, isUnsandboxedInvocation, stripUnsandboxed } from "./config.js"
 import { createRuntime } from "./runtime.js"
 import { createClassifier } from "./classifier.js"
 import { createGate } from "./policy.js"
@@ -158,6 +158,15 @@ export function createSetup(overrides) {
         const input = isPlainObject(event.input) ? event.input : undefined
         if (!input || typeof input.command !== "string") return
         const command = input.command // the ORIGINAL text: begin/recordAttempt key on it
+
+        // Agent-intentional escape hatch: a command (or any segment of a
+        // compound) prefixed with `unsandboxed --` skips the sandbox and
+        // runs through the normal permission flow (prompting the user). The
+        // marker is stripped so the underlying command executes unchanged.
+        if (isUnsandboxedInvocation(command)) {
+          input.command = stripUnsandboxed(command)
+          return
+        }
 
         const decision = await gate.decide({
           command,

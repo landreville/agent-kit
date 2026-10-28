@@ -526,6 +526,53 @@ test("evaluate (chained): the string execute.before produced is what evaluate re
   assert.equal(evaluate.effect, "allow")
 })
 
+test("execute.before happy path (compound): decide→wrap — recordAttempt/begin under the ORIGINAL text, evaluate flips the wrapped string to allow", async () => {
+  const { ctx, hooks } = makeCtx({})
+  const { setup, findCall, hookNames } = makeWorld()
+  await setup(ctx)
+
+  const payload = "set -e\ngit status --short" // a parseable compound (newline separator)
+  const event = beforeEvent(payload)
+  await hooks.tool[0].fn(event)
+
+  // The command is replaced WHOLESALE with the wrapped string.
+  assert.equal(event.input.command, `SRT-WRAPPED[${payload}]`)
+
+  // decide received the original compound text.
+  assert.deepEqual(findCall("decide").args, [
+    { command: payload, ctx, sessionID: "s1", agentID: "build", callID: "call_1" },
+  ])
+
+  // begin and recordAttempt see the ORIGINAL compound text; begin carries
+  // the wrapped string for the dual index.
+  assert.deepEqual(findCall("begin").args, [
+    payload,
+    { commandId: "test-command-id", cwd: "/repo", wrapped: `SRT-WRAPPED[${payload}]` },
+  ])
+  assert.deepEqual(findCall("recordAttempt").args, [payload])
+
+  // The whole wrap sequence, in order.
+  assert.deepEqual(hookNames(), [
+    "decide",
+    "availability",
+    "load",
+    "wrapWithSandbox",
+    "recordAttempt",
+    "begin",
+  ])
+
+  // The harness evaluates the WRAPPED compound; the plugin recognizes its
+  // own string and flips — the decision was made pre-wrap on the original.
+  const evaluate = {
+    action: "shell",
+    effect: "ask",
+    resources: [event.input.command],
+    source: { type: "tool", messageID: "msg_1", id: "call_1" },
+  }
+  await hooks.permission[0].fn(evaluate)
+  assert.equal(evaluate.effect, "allow")
+})
+
 // Final-review fix wave (RED → GREEN): the messages below are the
 // Important 1 / Important 2 / M-1 / M-4 assertions. Each one FAILED
 // against the pre-fix wiring:

@@ -1,6 +1,6 @@
 /**
  * sbx-reorder-probe — a throwaway OpenCode v2 probe plugin (Task 1 of the
- * 2026-10-10 sandbox-reorder plan).
+ * 2026-10-10 sandbox-reorder plan, docs/superpowers/plans/2026-10-10-sandbox-reorder.md).
  * It verifies the four assumptions the v2 redesign rests on by appending JSON
  * lines to `events.log` in this plugin's own directory (i.e.
  * /tmp/sbx-reorder-probe/events.log when installed via the

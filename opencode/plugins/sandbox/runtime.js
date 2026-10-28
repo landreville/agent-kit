@@ -16,8 +16,10 @@
  * per process (only `reset()` clears it), so whatever the self-test
  * initializes with is what every later wrap runs under. On a clean host
  * the probe exits 0 → mode "seccomp". On hosts whose AppArmor policy
- * capability-strips the vendored apply-seccomp helper (Ubuntu with
- * `kernel.apparmor_restrict_unprivileged_userns=1`), every wrapped command
+ * capability-strips the vendored apply-seccomp helper — Ubuntu's
+ * `kernel.apparmor_restrict_unprivileged_userns=1` restriction, or,
+ * sysctl-independent, its hardened `bwrap-userns-restrict` profile —
+ * every wrapped command
  * dies at startup with the apply-seccomp signature — a non-zero exit of
  * the no-op command IS a startup-class failure — so the self-test resets,
  * re-initializes once with `network.allowAllUnixSockets: true` merged into
@@ -62,8 +64,14 @@ const INSTALL_TIMEOUT_MS = 120_000
 const APPLY_SECCOMP_SIGNATURE = /apply-seccomp:/
 
 /** What restores full (seccomp) containment on a restricted host, named
- * in the degraded-mode warning. */
-const HOST_FIX = "sysctl kernel.apparmor_restrict_unprivileged_userns=0"
+ * in the degraded-mode warning. Two AppArmor mechanisms can be the
+ * blocker; the kernel-log check in the string tells them apart. */
+const HOST_FIX =
+  "sysctl kernel.apparmor_restrict_unprivileged_userns=0; if instead the " +
+  "kernel log shows unpriv_bwrap sys_admin denials (`journalctl -k`), " +
+  "Ubuntu's hardened bwrap-userns-restrict AppArmor profile is the blocker " +
+  "— no bwrap child can regain CAP_SYS_ADMIN while it is loaded, sysctl or " +
+  "not — disable or replace it (weigh the trade-offs first)"
 
 /** The trivial command the self-test wraps and spawns: it cannot fail on
  * its own, so any non-zero exit (or spawn error) is a startup-class

@@ -22,7 +22,7 @@ permission decision exists for that command (`tool.execute.before` →
 
 | Hook | Role |
 |---|---|
-| `ctx.tool.hook("execute.before")` | **Decide + wrap** — `policy.js`'s gate predicts the permission outcome for the command (see *Permission prediction*) and, only for a simple command that would ASK, runs the eligibility chain (availability → exclusions / `srt` → failure memory → attempt cap → classifier → install consent) and wraps it by rewriting `event.input.command` wholesale with the `SandboxManager.wrapWithSandbox` string — a 128-bit `commandId` for attribution, and a per-call filesystem config resolved from the session's location directory. The rewrite is the LAST mutation: every failure path leaves the input untouched and the rules decide normally. |
+| `ctx.tool.hook("execute.before")` | **Decide + wrap** — `policy.js`'s gate predicts the permission outcome for the command (see *Permission prediction*) and, only for a command that would ASK (simple or compound, when the segmenter accepts the shape), runs the eligibility chain (availability → exclusions / `srt` → failure memory → attempt cap → classifier → install consent) and wraps it by rewriting `event.input.command` wholesale with the `SandboxManager.wrapWithSandbox` string — a 128-bit `commandId` for attribution, and a per-call filesystem config resolved from the session's location directory. The rewrite is the LAST mutation: every failure path leaves the input untouched and the rules decide normally. |
 | `ctx.permission.hook("evaluate")` | **Recognize** — a resource that exact-matches a wrapped string this plugin produced flips to `allow` (the decision was made pre-wrap on the original command; the headless runner auto-rejects asks, so the flip is what lets wrapped commands run at all). Otherwise it only surfaces a stashed message (the one-time unavailable message, the classifier's `UNSAFE` reason, the install consent). It never flips anything the plugin did not wrap. **Shell-action events only** — the shell tool's `prepare` asks about `external_directory` first, under the same call id, so a non-shell action is a strict no-op and the message stash is consumed by exactly the ask that carries the command — **and never from a `deny`**: a deny rule matching the wrapped resource (or another plugin's deny) stays final, because the flip only ever answers an ask. |
 | `ctx.tool.hook("execute.after")` | **Observe + consent** — `violations.js`: attribute failures (violations for the `commandId`, or denial markers in the output), remember sandbox-blocked commands, annotate results (`(ran in sandbox: writes limited to <cwd>; network denied except configured domains)`); non-shell tools are strict no-ops. A completed **shell** run is the consent flow's proof of approval (a rejected ask also fires `execute.after`, with `status: "error"` — the command never spawned — and a non-shell tool never proves a shell ask at all) and fires the consented background install. |
 
@@ -52,23 +52,57 @@ the agent rules, so a rule added mid-session takes effect on the next
 command. There are no verdicts: the decision and the wrap happen
 together, before the permission check.
 
-**Scope: simple commands.** A command with shell separators is never
-wrapped — it follows the normal permission flow. "Simple" means the shell
-*scanner* sees ONE command: no `&&`, `||`, `;`, or `|` (by
-`commandKeys`), no raw newline or carriage return, and no `&` at all —
-a bare `&` backgrounds and the scanner splits it just like `&&` does
-(`packages/core/src/shell/scan.ts`). The `&` rule is deliberately
-conservative: `2>&1` and `&>file` are single commands that are simply left
-unwrapped (they prompt, which fails safe), rather than wrapping something
-whose fragments could never equal the wrapped string. The prediction and
-the evaluate recognizer both key on the exact command string, which holds
-for single commands and degrades for anything else; compounds are a
-documented follow-up, not a silent hole.
+**Scope: compound commands are now supported.** A command is wrapped
+when `segments.js` (the feature's single shared parser) accepts its shape
+and every segment would ASK under the effective rules — the same
+eligibility chain as a simple command, applied per segment. The supported
+grammar is commands joined at top level by `&&`, `||`, `;`, `|`, or a
+raw newline (blank lines between commands are dropped), with normal
+quoting (`'…'` literal, `"…"` with backslash escapes, unquoted backslash
+escapes) and legal fd-dup redirects (`2>&1`, `>&2`, `<&0`). Rejected
+shapes — which follow the normal permission flow, exactly as before — are:
+subshells `( … )`; command substitution `$( … )` / backticks; process
+substitution `<(` / `>(`; heredocs `<<`; backgrounding `&`; the bashisms
+`&>`, `>&&`, `<&>`, `|&`; ANSI-C quoting `$'…'`; unquoted `#` comments;
+unbalanced quotes; and an empty segment at an operator boundary (trailing
+`&&`, `a ;; b`). The segmenter's accept-set is deliberately *narrower*
+than the shell scanner's, so anything that cannot be predicted faithfully
+is left unwrapped rather than mis-predicted.
+
+**Deny is sacred across both permission actions.** Prediction runs over
+the two assert sets core runs: the `shell` action (one resource per
+segment) and the `external_directory` action (one per `cd`/`pushd`/…
+segment's resolved directory). A deny on *either* action for *any* segment
+makes the whole compound skip — the harness denies the invocation before
+anything prompts. All-allow on both → skip too (runs exactly as
+configured). Only an ask somewhere falls through to the eligibility
+chain. A wrap suppresses the `external_directory` assert entirely (the
+wrapped command's scan sees only the sandbox runner), which is why the
+prediction must mirror it here.
 
 **`srt` invocations are never sandboxed.** If any segment of the command
 has `srt` as its first token (`srt -- npm test`, `cd x && srt -- make`),
 the command is left to normal permissions — the agent is deliberately
-sandboxing on its own; no double-sandboxing.
+sandboxing on its own; no double-sandboxing. (This check is per-segment,
+so a compound is excluded when any single segment invokes `srt`.)
+
+**`unsandboxed --` runs a command outside the sandbox on purpose.** If any
+segment of the command has `unsandboxed` as its first token
+(`unsandboxed -- ssh heart-of-gold`, `cd x && unsandboxed -- make`),
+the plugin strips the marker and leaves the underlying command to the
+normal permission flow — it asks, and on approval runs unsandboxed. Use
+this when the sandbox would (correctly) block the command but the work
+genuinely needs outside access; the marker is per-segment, so a compound
+is unsandboxed when any single segment carries it, and quoted content
+inside a segment's args never counts.
+
+**`excludedCommands` is per-segment.** A compound is excluded when any
+single segment matches a pattern (pattern semantics unchanged —
+`docker compose *` matches the base command alone or followed by
+arguments, a boundary, not `docker composese`; anything else is an exact
+match). Quoted content inside a segment's args (`echo "docker compose"`)
+never counts as a segment. When the segmenter rejects the shape, the
+full text is matched exactly as before, keeping the check total.
 
 ## Install
 
@@ -121,7 +155,7 @@ that field's default; nothing throws):
 | `filesystem.allowWrite` | `[]` | extra writable roots; every run also allows the command's cwd, the system tmpdir, and — in a linked worktree — the shared git dir |
 | `filesystem.denyWrite` | `[]` | extra never-writable paths; every run also denies `<cwd>/.git/config` and `<cwd>/.git/hooks` (plus the shared git dir's) |
 | `credentials.envVars` | the 8 names below | scrubbed inside the sandbox; a bare string denies, an object `{ "name": …, "mode": "deny" }` sets the mode, a same-name entry overrides the default |
-| `excludedCommands` | `[]` | never sandboxed: `docker compose *` matches the base command alone or followed by arguments (a boundary — not `docker composese`); anything else is an exact match |
+| `excludedCommands` | `[]` | never sandboxed, matched per segment: a compound is excluded when any single segment matches (quoted content inside a segment's args never counts as a segment); `docker compose *` matches the base command alone or followed by arguments (a boundary — not `docker composese`); anything else is an exact match; an unparseable shape falls back to matching the full text |
 | `classifier` | `{ "enabled": false, "providerID": "litellm", "id": "jev-1.13" }` | opt-in pre-classification, see *The classifier* |
 | `maxSandboxAttempts` | `3` | lifetime cap of sandboxed runs per command text (a backstop, not the primary mechanism) |
 | `failureMemorySec` | `1800` | how long a sandbox-blocked command is remembered — its retry asks |
@@ -150,16 +184,19 @@ deny-reads, scrubbed env — if validation fails), wrap the trivial command
 - Exit 0 → **seccomp mode**: full containment, including seccomp
   Unix-socket blocking.
 - The wrapped `true` dies with the `apply-seccomp` startup signature —
-  Ubuntu hosts with `kernel.apparmor_restrict_unprivileged_userns=1`
-  capability-strip the vendored `apply-seccomp` helper, so every
-  seccomp-mode command exits before running — → **one** automatic retry
+  Ubuntu's AppArmor policy capability-strips the vendored
+  `apply-seccomp` helper's nested userns, either through the
+  `kernel.apparmor_restrict_unprivileged_userns=1` restriction or,
+  independently of that sysctl, through the hardened
+  `bwrap-userns-restrict` profile — so every seccomp-mode command exits
+  before running — → **one** automatic retry
   with `network.allowAllUnixSockets: true`, which skips apply-seccomp
   entirely and runs in bwrap's own namespaces: **degraded mode**.
   Filesystem and network isolation are unaffected; Unix-socket blocking
   is off. Every degraded initialize logs:
 
   ```
-  [sandbox] seccomp sandbox unavailable on this host (…) — running degraded with network.allowAllUnixSockets: true, so unix-socket blocking is off; host fix: sysctl kernel.apparmor_restrict_unprivileged_userns=0
+  [sandbox] seccomp sandbox unavailable on this host (…) — running degraded with network.allowAllUnixSockets: true, so unix-socket blocking is off; host fix: sysctl kernel.apparmor_restrict_unprivileged_userns=0; if instead the kernel log shows unpriv_bwrap sys_admin denials (`journalctl -k`), Ubuntu's hardened bwrap-userns-restrict AppArmor profile is the blocker — no bwrap child can regain CAP_SYS_ADMIN while it is loaded, sysctl or not — disable or replace it (weigh the trade-offs first)
   ```
 
 - `requireSeccomp: true` keeps the plugin inert instead of degrading —
@@ -169,10 +206,10 @@ deny-reads, scrubbed env — if validation fails), wrap the trivial command
 - The self-test is also the initialization: the library's `initialize()`
   is first-call-wins, so the config the self-test proved — seccomp or
   degraded — is what every later command runs under.
-- Fix the host (the sysctl, persisted under `/etc/sysctl.d/`, or an
-  AppArmor `userns` profile for the vendored `apply-seccomp`) and the next
-  process's self-test lands in seccomp mode with no config change: the
-  plugin self-strengthens.
+- Fix the host — see "The degraded-mode warning" under Troubleshooting
+  for which of the two AppArmor mechanisms blocks you and what each fix
+  costs — and the next process's self-test lands in seccomp mode with no
+  config change: the plugin self-strengthens.
 - `SandboxManager.checkDependencies()` is never the gate — it reports
   clean on the AppArmor-restricted hosts above while every seccomp-mode
   command dies. It only names missing binaries; the spawned self-test
@@ -260,7 +297,7 @@ never called.
 | ask-bound command, sandbox-eligible | runs sandboxed with no prompt, annotated result |
 | the sandbox blocks it (network / write / denied read) | failure remembered + annotated; the retry asks and runs unsandboxed on approval |
 | command fails for its own reasons | normal failure; retries stay prompt-free |
-| compound command (`&&`/`\|\|`/`;`/`\|`), multi-line (`\n`), or backgrounded (`&`) | never wrapped — normal permission flow (documented scope) |
+| unparseable compound shape (subshell, `$( )`, heredoc, background `&`, unbalanced quote, …) | never wrapped — normal permission flow (documented scope) |
 | predicted `allow` (allow-listed command) | never wrapped — runs exactly as configured |
 | predicted `deny` | never wrapped — the harness's denial stays final |
 | package missing | consent ask (`install: "ask"`) or inert (`"never"`) |
@@ -282,15 +319,17 @@ From the Task 1 probe (`probe/probe.mjs`, `probe/import-check.mjs`),
   symlinked entry path (the probe's `/tmp/sandbox-plugin-link` — the same
   shape as `~/.config/opencode/plugins/sandbox` → repo), so the documented
   wiring needs no absolute-path fallback.
-- **Host mode**: this workstation is `HOST-MODE: no-seccomp` (Ubuntu
-  26.04.1, `kernel.apparmor_restrict_unprivileged_userns=1`). `bwrap`
-  has an AppArmor profile; the vendored `apply-seccomp` helper does not,
-  and its nested userns is capability-stripped — every seccomp-mode
-  wrapped command dies at startup with `apply-seccomp: write
-  /proc/self/setgroups …: Permission denied`. The degraded fallback is
-  therefore the expected steady state here; `node probe/probe.mjs`
-  re-checks it (on this host it prints 4/4 PASS with exactly one
-  attribution SKIP, final line `HOST-MODE: no-seccomp`, exit 0).
+- **Host mode**: this workstation is `HOST-MODE: seccomp` (Ubuntu
+  26.04.1 as of 2026-10-14, after setting
+  `kernel.apparmor_restrict_unprivileged_userns=0` **and** disabling the
+  hardened `bwrap-userns-restrict` profile — see "The degraded-mode
+  warning" for why both levers were needed; before that, and on any
+  Ubuntu with that profile loaded, the vendored `apply-seccomp` helper is
+  capability-stripped and every seccomp-mode wrapped command dies at
+  startup with `apply-seccomp: write /proc/self/setgroups …: Permission
+  denied`, making the degraded fallback the steady state).
+  `node probe/probe.mjs` re-checks it (on this host it prints 4/4 PASS
+  with two attribution SKIPs, final line `HOST-MODE: seccomp`, exit 0).
 - **Violation attribution is partial on Linux**: network denies are
   attributed (proxy-side, keyed by the `commandId` embedded in the proxy
   auth — `deny network-outbound example.com:443 (host is not on the allow
@@ -316,15 +355,29 @@ From the Task 1 probe (`probe/probe.mjs`, `probe/import-check.mjs`),
   session / reload the config) and the next eligible command asks again.
 - **The degraded-mode warning.** `[sandbox] seccomp sandbox unavailable
   on this host (…) — running degraded with network.allowAllUnixSockets:
-  true, so unix-socket blocking is off; host fix: sysctl
-  kernel.apparmor_restrict_unprivileged_userns=0` means: the seccomp
-  filter is unavailable (AppArmor userns restriction), so the plugin fell
-  back to bwrap-namespace mode. Filesystem and network isolation are
-  unaffected, but sandboxed processes *can* reach host Unix sockets
-  (e.g. `/var/run/docker.sock` — effectively root on a Docker host). The
-  fix is the named sysctl (persist under `/etc/sysctl.d/`) or an AppArmor
-  `userns` profile for the vendored `…/vendor/seccomp/*/apply-seccomp`;
-  after it, the next process self-strengthens to seccomp mode.
+  true, so unix-socket blocking is off; host fix: …` means: the vendored
+  `apply-seccomp` helper cannot get its nested user namespace, so the
+  plugin fell back to bwrap-namespace mode. Filesystem and network
+  isolation are unaffected, but sandboxed processes *can* reach host
+  Unix sockets visible inside the sandbox (e.g. `/var/run/docker.sock` —
+  effectively root on a Docker host). Two different AppArmor mechanisms
+  cause this and they need different fixes — tell them apart with
+  `journalctl -k | grep apparmor` after a failed self-test:
+  - `profile="unprivileged_userns"` denials: the
+    `kernel.apparmor_restrict_unprivileged_userns` restriction is the
+    blocker. Set it to `0` (persist under `/etc/sysctl.d/`).
+  - `profile="unpriv_bwrap"` `capname="sys_admin"` denials: Ubuntu's
+    hardened `bwrap-userns-restrict` profile is the blocker (shipped
+    enabled on 26.04). It stacks a capability-deny onto every bwrap
+    child, and inside bwrap `no_new_privs` means profiles can only
+    *stack* onto the child's profile, never replace it — so no
+    in-sandbox process can regain `CAP_SYS_ADMIN`, sysctl or not, and a
+    `userns` profile for `apply-seccomp` itself cannot help. The only
+    fixes are disabling or replacing that profile (`disable/` symlink +
+    `apparmor_parser -R`) — which also drops its mitigation for every
+    other bwrap user, flatpak included — or accepting degraded mode.
+
+  After the fix, the next process self-strengthens to seccomp mode.
   `requireSeccomp: true` makes the plugin inert instead.
 - **Why did my command still ask?** In order of likelihood: (1) it — or a
   segment of it — was **sandbox-blocked within the last
@@ -345,27 +398,34 @@ From the Task 1 probe (`probe/probe.mjs`, `probe/import-check.mjs`),
 
 ## Known limitations
 
-- **Compound commands are never wrapped.** A command containing
-  `&&`, `||`, `;`, or `|` follows the normal permission flow. The
-  permission prediction and the evaluate recognizer both key on the exact
-  command string, which holds for single commands and degrades for
-  compounds (the scanner fragments them); wrapping compounds correctly is
-  a follow-up, not a silent hole — they simply keep prompting.
-- **Neither are multi-line or backgrounded commands** — and, deliberately
-  conservative, `2>&1` / `&>file` redirects. The shell scanner splits on a
-  raw newline and a bare `&` exactly as it splits on `&&`, `;`, and `|`
-  (`packages/core/src/shell/scan.ts`), so `policy.js`'s simple-command test
-  excludes any command containing `\n`, `\r`, or `&`. The `&` rule is wider
-  than the scanner's fragmenting case: a plain redirect is a single
-  command the scanner keeps whole, and the plugin still leaves it
-  unwrapped — failing safe (it prompts) rather than wrapping a command
-  whose fragments could never exact-match the wrapped string.
+- **Compound commands are now supported (parseable shapes).** A
+  command joined by `&&`, `||`, `;`, `|`, or a raw newline is wrapped
+  when `segments.js` accepts the shape and every segment would ASK under
+  the effective rules — deny on *either* the `shell` or the
+  `external_directory` action for any segment still wins (the harness
+  denies before anything prompts), and all-allow on both runs exactly as
+  configured. The permission prediction runs per segment, and the evaluate
+  recognizer keys on the *wrapped* string (which the wiring dual-indexes
+  under the original text), so compounds flip to allow exactly like simple
+  commands. Unparseable shapes (subshells, `$( )`, heredocs, background
+  `&`, unbalanced quotes, …) are still never wrapped and follow the normal
+  permission flow — a documented scope, not a silent hole.
+- **Multi-line scripts are supported when parseable** — blank lines
+  between commands are dropped (a script ending in a newline is normal).
+  Backgrounded commands (`&`) and the bashisms (`&>`, `>&&`, `<&>`,
+  `|&`) are still never wrapped, and fd-dup redirects (`2>&1`, `>&2`)
+  are legal inside a segment. A single command containing a raw newline
+  that is *not* a separator boundary is not a supported shape and stays
+  unwrapped (failing safe).
 - **The prediction cannot see runtime "allow always" approvals.** They
   live in the permission store, which the plugin API does not expose, so
   a saved-approved command may be predicted `ask` and wrapped. Safe
   direction (a wrapped read-only command behaves identically); a wrapped
-  network command fails and its retry asks. List any command that must
-  never be wrapped in `excludedCommands`.
+  network command fails and its retry asks. This drift now applies to
+  compounds too — a compound that is allow-listed at runtime but predicted
+  `ask` is wrapped, and its retry follows the normal flow. List any
+  command that must never be wrapped in `excludedCommands` (matched
+  per-segment).
 - **The session directory, not the command's `workdir`, scopes the
   sandbox.** The `shell.create.before` hook (which carried the per-command
   cwd) is gone in v2, so the wrap uses the session's location directory;
@@ -377,7 +437,7 @@ From the Task 1 probe (`probe/probe.mjs`, `probe/import-check.mjs`),
 ## Development
 
 ```bash
-npm test              # node --test — 153 tests, no network
+npm test              # node --test — 238 tests, no network
 node probe/probe.mjs  # prints the host-mode verdict: HOST-MODE: seccomp | no-seccomp
 ```
 

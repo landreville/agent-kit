@@ -27,7 +27,7 @@ export function parseVerdict(content: string): Verdict | undefined {
 export async function callJudge(opts: { cfg: Config["judge"]; model: string; system: string; user: string; fetchImpl: typeof fetch; responseFormat?: "json_schema" | "json_object"; deadline?: number }): Promise<{ content: string; tokensIn?: number; tokensOut?: number }> {
   const fmt = opts.responseFormat ?? "json_schema"
   const body = {
-    model: opts.model, temperature: 0, max_tokens: 200,
+    model: opts.model, temperature: 0, max_tokens: opts.cfg.maxTokens,
     messages: [{ role: "system", content: opts.system }, { role: "user", content: opts.user }],
     response_format: fmt === "json_schema" ? { type: "json_schema", json_schema: JSON_SCHEMA } : { type: "json_object" },
   }

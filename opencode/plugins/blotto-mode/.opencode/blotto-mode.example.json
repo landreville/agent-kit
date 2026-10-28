@@ -6,6 +6,7 @@
     "apiKey": "{env:LITELLM_API_KEY}",
     "model": "glm-5.3-flash",
     "fallbackModel": null,
+    "maxTokens": 2000,
     "timeoutMs": 8000,
     "userMessageCount": 6,
     "contextTokenBudget": 1500

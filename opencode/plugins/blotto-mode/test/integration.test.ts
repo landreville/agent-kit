@@ -33,8 +33,10 @@ async function boot(opts: { logOverride?: DecisionLog; client?: any; judge?: (bo
 async function ask(hooks: any, p: Permission) { const out = { status: "ask" as "ask" | "deny" | "allow" }; await hooks["permission.ask"](p, out); return out.status }
 const replied = (sessionID: string, permissionID: string) => ({ event: { type: "permission.replied", properties: { sessionID, permissionID, response: "once" } } })
 
-test("index.ts exports exactly BlottoMode (no default, no createPlugin)", () => {
-  expect(Object.keys(indexExports)).toEqual(["BlottoMode"])
+test("index.ts exports BlottoMode and a default v2 plugin definition", () => {
+  expect(Object.keys(indexExports)).toEqual(["BlottoMode", "default"])
+  expect(indexExports.default).toMatchObject({ id: "blotto-mode" })
+  expect(typeof indexExports.default.setup).toBe("function")
 })
 
 test("hard rule denies, injects reason, logs, and never calls the judge", async () => {
@@ -67,6 +69,18 @@ test("judge failure leaves ask, toasts, logs fallback; a later permission.replie
   await hooks.event(replied("s1", "unknown"))
   const merged = DecisionLog.merge(DecisionLog.read(logPath))
   expect(merged.length).toBe(1); expect(merged[0]!.userReply).toBe("once")
+})
+
+test("permission.replied with malformed/null properties never throws", async () => {
+  // OpenCode v2 event forwarding delivered null properties during the
+  // Phase 4 drill ("Cannot destructure property 'permissionID' from null").
+  // The handler must leave every malformed event alone.
+  const { hooks, logPath } = await boot({})
+  await expect(hooks.event({ event: { type: "permission.replied", properties: null } })).resolves.toBeUndefined()
+  await expect(hooks.event({ event: { type: "permission.replied" } })).resolves.toBeUndefined()
+  await expect(hooks.event({ event: { type: "session.deleted", properties: null } })).resolves.toBeUndefined()
+  await expect(hooks.event({ event: { type: "unrelated.event", properties: null } })).resolves.toBeUndefined()
+  expect(DecisionLog.read(logPath).filter((r) => r.kind === "reply")).toEqual([])
 })
 
 test("permission.replied for an unseen id does not throw and writes no reply record", async () => {

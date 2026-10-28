@@ -3,7 +3,7 @@ import { resolve } from "node:path"
 import type { ActionRequest, Kind } from "./types"
 import { parseBash } from "./bash"
 
-const DIRECT: Record<string, Kind> = { bash: "bash", webfetch: "webfetch", websearch: "websearch", external_directory: "external_directory", edit: "edit", write: "edit" }
+const DIRECT: Record<string, Kind> = { bash: "bash", shell: "bash", webfetch: "webfetch", websearch: "websearch", external_directory: "external_directory", edit: "edit", write: "edit" }
 
 export function kindOf(type: string): Kind | undefined {
   if (type in DIRECT) return DIRECT[type]

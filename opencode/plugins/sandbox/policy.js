@@ -15,16 +15,37 @@
  * Decide chain (first match wins):
  *   0. `markInstallDeclined()` was called, or `enabled: false` → inert:
  *      always `{ kind: "skip" }`, without consulting rules or runtime.
- *   1. Simple commands only — no `&&`/`||`/`;`/`|` segment, no raw
- *      newline, and NO `&` at all (a bare `&` backgrounds; `2>&1` is the
- *      deliberately conservative casualty — it is simply not wrapped);
- *      anything the shell SCANNER would fragment follows the normal
- *      permission flow unwrapped (see `isSimpleCommand` and the
- *      `SCANNER_SEPARATORS` note on `shell/scan.ts:590,710`).
- *   2. `loadRules(ctx, sessionID, agentID)` (this gate's own loader) not
- *      ok → skip (status quo: nothing is ever wrapped on a failed
- *      prediction). Predicted `deny` or `allow` → skip with NO
- *      runtime/classifier calls.
+ *   1. Segmentation via segments.js — `segmentCommand(command)`, the
+ *      SINGLE parser the whole compound-command feature shares (quote
+ *      aware, total, strictly fail-closed). An UNPARSEABLE shape —
+ *      subshell `(…)`, `$(`, backtick, heredoc `<<`, background `&`, the
+ *      bashisms `|&`/`&>`, `$'`, an unquoted `#`, unbalanced quotes, or
+ *      an empty segment at an operator boundary (including the blank
+ *      candidate at a mixed operator+newline boundary, `a &&\nb` —
+ *      segments.js rejects it, and the gate treats that as unparseable)
+ *      → skip: the command's permission outcome cannot be predicted
+ *      faithfully over it, so it follows the normal permission flow
+ *      (status quo). The reason is logged once per reason string (for
+ *      operators, never in a message). This replaces the v2
+ *      simple-command test (which skipped on raw newlines and any `&`):
+ *      carrying the protectiveness now is segments.js's ANTI-DRIFT
+ *      contract — its accept-set is deliberately narrower than the shell
+ *      scanner's (`scan.ts:590,710`) and every segment it emits covers
+ *      the scanner's resources for that shape.
+ *   2. Prediction over BOTH assert sets core runs (in their order). The
+ *      shell set: ONE resource per segment — core aggregates
+ *      `permission.ts:173-189`, any resource denied → deny, else any ask.
+ *      The set that runs BEFORE it: `authorizeExternal`
+ *      (`file-access.ts:125-142`) under action `external_directory` for
+ *      every cwd-set segment's directory — the resolved ABSOLUTE path
+ *      (~ expansion, `file-access.ts:67-76`) against the same session cwd
+ *      the wrap is scoped to — and a wrap suppresses it ENTIRELY (the
+ *      wrapped command's scan sees only the sandbox runner: no
+ *      directories), which is why the prediction must mirror it here.
+ *      Aggregation across both, mirroring core: ANY deny → skip (core
+ *      denies the invocation on either action before anything prompts);
+ *      ALL allow → skip (the command runs exactly as the user's rules
+ *      configured); ANY ask → fall through to the eligibility chain.
  *   3. `await runtime.availability({ options, requireSeccomp:
  *      options.requireSeccomp })` not ok → skip, with a one-time message
  *      naming the reason (the "messaged once" flag; subsequent commands
@@ -57,15 +78,17 @@
  * `messageFor(callID)` returns the stashed `{ message }` exactly once
  * (consumed on read) so the evaluate hook can surface it on the ask.
  *
- * `commandKeys(command)` — full text plus its `&&`/`||`/`;`/`|`-segments —
- * remains the shared correlation contract for `recordAttempt` /
+ * `commandKeys(command)` — the full text, its naive
+ * `&&`/`||`/`;`/`|`-segments, AND (when the segmenter accepts) segments.js's
+ * segments — remains the shared correlation contract for `recordAttempt` /
  * `recordSandboxFailure`: the wiring records with the FULL command text,
- * and the segment keys line a compound's fragments up with a later simple
- * decide (a compound's retry finds the failure whichever shape it arrives
- * in). A non-string command normalizes to `[""]` (a key no real command
- * ever carries). It is NOT the simple-command test on its own — see
- * `isSimpleCommand`, which unions it with the shell scanner's separator
- * set.
+ * and the key union lines a compound's fragments up with a later decide
+ * (a compound's retry finds the failure whichever shape it arrives in).
+ * A non-string command normalizes to `[""]` (a key no real command ever
+ * carries). It is a CORRELATION contract, not the decision — what
+ * segments over would-ask/allow/deny is decided is `segmentCommand`'s
+ * job (see step 1), and the naive split inside this union stays so v2-era
+ * keys never alias away.
  *
  * STATE IS PER PLUGIN INSTANCE: every gate owns its rule loader (an
  * agent-ruleset cache that survives a config edit would keep predicting
@@ -99,9 +122,11 @@
  * command.
  */
 
-import { tmpdir } from "node:os"
-import { isSrtInvocation, matchesExcludedCommand } from "./config.js"
+import { tmpdir, homedir } from "node:os"
+import path from "node:path"
+import { isSrtInvocation, isUnsandboxedInvocation, matchesExcludedCommand } from "./config.js"
 import { createRuleLoader, predictPermission } from "./rules.js"
+import { segmentCommand } from "./segments.js"
 
 /** Step 7's message: approval of the ask runs this command with normal
  * permissions and consents to the local npm install (performed in the
@@ -117,34 +142,31 @@ function isPlainObject(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value)
 }
 
-/** The segment split, mirroring config.js's `isSrtInvocation` segmentation. */
+/** The NAIVE segment split, mirroring config.js's `isSrtInvocation`
+ * segmentation. Still the correlation fallback inside `commandKeys` —
+ * decide itself does NOT use it: the decision segments via
+ * `segmentCommand` (segments.js), the feature's single shared parser. */
 const SEGMENT_SPLIT = /&&|\|\||[;|]/
 
-/** The SHELL SCANNER's separator set
- * (`packages/core/src/shell/scan.ts:590` — `"<>&|;\n".includes(char)` — and
- * `:710`, `const separator = operator ?? char`, with the newline's heredoc
- * re-processing): how the scanner decides that one input is MORE than one
- * command. It is a superset of `SEGMENT_SPLIT` above, which is why the
- * simple-command test cannot be `commandKeys(...).length === 1` alone.
- * THE TWO DEFINITIONS MUST NOT DRIFT APART: `isSimpleCommand` is the
- * conservative union of both (a raw newline or a `\r`, and ANY `&` —
- * `&&`, `||`'s cousins, a background `&`, and the redirect `2>&1`), so a
- * command the scanner fragments is never wrapped, while a command the
- * scanner sees as ONE command still is. */
-const SCANNER_SEPARATORS = /[\n\r]/
-
 /**
- * The shared state-key helper: `[command, ...its &&/||/;/|-separated
- * segments]` — the full text verbatim, then each segment trimmed (empty
- * segments dropped), deduped with first occurrence winning. The wiring
- * imports this so failure/attempt keys line up across hooks, and decide
- * uses its cardinality as part of the simple-command test: exactly one key
- * means no `&&`/`||`/`;`/`|` segments. A non-string command normalizes to
- * `[""]` (a key no real command ever carries).
+ * The shared state-key helper: `[command, ...its naive
+ * &&/||/;/|-segments, ...segments.js's segments when the segmenter
+ * accepts]` — the full text verbatim, then each key trimmed (empty keys
+ * dropped), deduped with first occurrence winning. The segmenter's
+ * segments are what makes a newline-separated script's fragments
+ * correlate (the naive split does not see newlines); an unparseable shape
+ * falls back to the naive keys alone — segments.js is total, so this
+ * union never throws and never gains a fake segment. A non-string
+ * command normalizes to `[""]` (a key no real command ever carries).
  *
- * NOTE: this is a CORRELATION contract, not a scanner mirror — it is
- * deliberately narrower than the shell scanner's separator set (see
- * `SCANNER_SEPARATORS` and `isSimpleCommand`).
+ * NOTE: this is a CORRELATION contract, NOT the decision. The shell
+ * scanner's separator set (`packages/core/src/shell/scan.ts:590` —
+ * `"<>&|;\n".includes(char)` — and `:710`, `const separator = operator ??
+ * char`) is wider than any of the key sets here. With the segment-level
+ * gate, the old `isSimpleCommand` scanner-separator union is GONE: what
+ * carries the decision's protectiveness now is `segmentCommand`'s
+ * reject-set (see the module header, step 1), and this union only needs
+ * to keep the naive keys so v2-era failure/attempt keys never alias away.
  *
  * @param {string} command
  * @returns {string[]}
@@ -156,36 +178,127 @@ export function commandKeys(command) {
     const trimmed = segment.trim()
     if (trimmed !== "") keys.push(trimmed)
   }
+  // The segmenter's segments join the union only when it ACCEPTS the
+  // shape (its reject reasons are logs-only; `{ ok: false }` contributes
+  // nothing).
+  const segmented = segmentCommand(text)
+  if (segmented.ok) keys.push(...segmented.segments)
   return [...new Set(keys)]
 }
 
+/** The cwd-command word set — VERBATIM transcription of
+ * `packages/core/src/shell/parse.ts:14` (the scanner routes exactly these
+ * commands into `directories`, which `authorizeExternal` then asserts
+ * under `external_directory` BEFORE the shell assert; `push-location` and
+ * `set-location` are the PowerShell aliases the same line carries — the
+ * scanner only lowercases the word for PowerShell, so on a POSIX scan the
+ * membership is the exact word). */
+const CWD_COMMANDS = new Set(["cd", "chdir", "popd", "pushd", "push-location", "set-location"])
+
+/** True when the segment's FIRST whitespace-delimited word is a cwd
+ * command — the route that carries an `external_directory` assert in
+ * core (the design's fact 5: the cwd set routes into `directories`, not
+ * shell resources). */
+function isCwdCommand(segment) {
+  return CWD_COMMANDS.has(segment.trim().split(/\s+/)[0])
+}
+
+/** Mirror of core's `resolvePath` home expansion
+ * (`packages/core/src/file-access.ts:67-76`, the POSIX arms): a bare `~`
+ * resolves to the home and a `~/…` to home/joined; anything else is
+ * returned unchanged for the caller's `path.resolve(base, …)`. `home`
+ * defaults to `os.homedir()` evaluated AT CALL TIME (on POSIX that is
+ * `$HOME`), so a test injects a home through the environment. */
+function resolveDirectory(dir, home = homedir()) {
+  return dir === "~" ? home : dir.startsWith("~/") ? path.join(home, dir.slice(2)) : dir
+}
+
+/** Quote-aware word split for ONE segment — the same quote state machine
+ * segments.js uses ('…' literal, "…" with backslash escapes, an unquoted
+ * backslash escapes the next character), with top-level whitespace as the
+ * only separator. This is how a cwd segment's directory argument is pinned
+ * down the way core's tree-sitter word list would present it
+ * (`parse.ts:309ff` walks parts; a quoted string is ONE part, so
+ * `cd "my dir"` yields the argument `my dir`, not `"my`). Only ever
+ * called on a segment segments.js ACCEPTED, so the segment's overall
+ * quote balance is guaranteed. */
+function segmentWords(segment) {
+  const words = []
+  let current = ""
+  let quote = null
+  let open = false
+  for (let i = 0; i < segment.length; i++) {
+    const c = segment[i]
+    if (quote === "'") {
+      current += c
+      if (c === "'") quote = null // literal: a backslash escapes nothing
+      continue
+    }
+    if (quote === '"') {
+      if (c === "\\") {
+        current += c + (segment[i + 1] ?? "")
+        i += 1 // hop: the escape pair is one word text
+        continue
+      }
+      current += c
+      if (c === '"') quote = null
+      continue
+    }
+    if (c === "\\") {
+      current += c + (segment[i + 1] ?? "")
+      i += 1
+      open = true
+      continue
+    }
+    if (c === "'" || c === '"') {
+      quote = c
+      current += c
+      open = true
+      continue
+    }
+    if (c === " " || c === "\t") {
+      if (open) {
+        words.push(current)
+        current = ""
+        open = false
+      }
+      continue
+    }
+    current += c
+    open = true
+  }
+  if (open) words.push(current)
+  return words
+}
+
 /**
- * Is this ONE command, as far as the shell scanner is concerned? Only
- * then are the wrapped string and the scanner's fragments the same string,
- * which is what makes the permission prediction (rules evaluated on the
- * exact command text) and the evaluate recognizer (an exact match against
- * the wrapped string) both hold.
+ * The cwd segment's directory arguments, mirroring core's POSIX
+ * extraction: EVERY word after the command name that is not a flag
+ * (`parse.ts:309-315` maps all of them, filtering `startsWith("-")`),
+ * its matching quotes stripped (`:338-343` `directoryArgument`), and —
+ * the DROP, mirroring `expandKnownDirectory` `:360-362` — a value that
+ * contains a `$` or a backtick is skipped (unknowable at
+ * permission-analysis time: core produces NO directory assert for that
+ * argument, so the gate produces no external_directory prediction for it
+ * either — the segment's own shell prediction remains the gate's
+ * protection). A bare `cd` with no argument resolves "." against the
+ * gate's session cwd (an over-prediction: core asserts nothing).
  *
- * Three conditions, all of which must hold:
- *   1. no `&&`/`||`/`;`/`|` segment (`commandKeys(command).length === 1`);
- *   2. no raw newline (`\n` / `\r`) — the scanner splits on them
- *      (`scan.ts:590,710`), so a multi-line input is several commands;
- *   3. no `&` AT ALL — a bare `&` backgrounds (the scanner splits there
- *      too), and this is deliberately conservative: `2>&1` and `&>file`
- *      are single commands the scanner does NOT fragment, yet they are
- *      left unwrapped. That fails safe (the normal permission flow asks,
- *      exactly as today), where wrapping them would strand the user with
- *      an unrecognizable bwrap prompt.
- *
- * @param {string} command
- * @returns {boolean}
+ * @param {string} segment
+ * @returns {string[]}
  */
-function isSimpleCommand(command) {
-  if (typeof command !== "string") return false
-  if (commandKeys(command).length !== 1) return false
-  if (SCANNER_SEPARATORS.test(command)) return false
-  if (command.includes("&")) return false
-  return true
+function directoryArgs(segment) {
+  const words = segmentWords(segment).slice(1).filter((word) => !word.startsWith("-"))
+  if (words.length === 0) return ["."]
+  const dirs = []
+  for (const word of words) {
+    const quote = word[0]
+    const text =
+      (quote === '"' || quote === "'") && word.at(-1) === quote ? word.slice(1, -1) : word
+    if (text.includes("$") || text.includes("`")) continue
+    dirs.push(text)
+  }
+  return dirs
 }
 
 /**
@@ -256,6 +369,10 @@ export function createGate(deps) {
   let unavailableMessaged = false
   /** One-way install-decline flag: once set, the gate is inert. */
   let installDeclined = false
+  /** The segmenter's rejection reasons already logged (once per distinct
+   * reason — the reason vocabulary is a fixed small set, so this is
+   * bounded). */
+  const rejectionLogged = new Set()
 
   /** The policy summary handed to the classifier, built from options.
    * Decide carries no cwd, so the write root renders as the honest
@@ -401,8 +518,9 @@ export function createGate(deps) {
 
   /**
    * The pre-permission decision (see the module header for the chain).
-   * Returns `{ kind: "wrap" }` only for a simple, predicted-ask command
-   * that clears the eligibility chain; every other path is
+   * Returns `{ kind: "wrap" }` only for a command the gate segmented
+   * faithfully whose segments clear BOTH assert-set predictions (no deny,
+   * at least one ask) and then the eligibility chain; every other path is
    * `{ kind: "skip" }` — with a `message` when the user should be told why
    * (also stashed under the call id for the evaluate hook). Never throws:
    * any internal error returns `{ kind: "skip" }` — the status quo.
@@ -421,23 +539,85 @@ export function createGate(deps) {
       if (command.trim() === "") return { kind: "skip" }
       const callID = typeof raw.callID === "string" ? raw.callID : ""
 
-      // Step 1 — simple commands only: anything the shell SCANNER would
-      // fragment follows the normal permission flow unwrapped, because
-      // both the prediction (rules evaluated on the exact command text)
-      // and the wrapped-resource exact match degrade the moment the
-      // command is more than one command. `&&`/`||`/`;`/`|` AND a raw
-      // newline AND any `&` (background, or the `2>&1` redirect — the
-      // conservative direction) are all out of scope.
-      if (!isSimpleCommand(command)) return { kind: "skip" }
+      // Step 1 — segment (segments.js, the single parser the whole
+      // compound-command feature shares). An unparseable shape — subshell,
+      // `$(…)`, heredoc, background `&`, `$'`, an unquoted comment,
+      // unbalanced quotes, an empty segment at an operator boundary
+      // (including the blank candidate at a mixed operator+newline
+      // boundary like `a &&\nb`) → skip: the command's permission outcome
+      // cannot be predicted faithfully over it, so it follows the normal
+      // permission flow (status quo, today's ask exactly). The reason is
+      // logged once per distinct reason string — for the operator, never
+      // in a message.
+      const segmented = segmentCommand(command)
+      if (!segmented.ok) {
+        if (!rejectionLogged.has(segmented.reason)) {
+          rejectionLogged.add(segmented.reason)
+          log(`[sandbox] gate: unparseable command (${segmented.reason}) — leaving the decision to the permissions`)
+        }
+        return { kind: "skip" }
+      }
+      const segments = segmented.segments
 
-      // Step 2 — predict the permission outcome locally. A failed
-      // prediction (loadRules not ok) is the status quo: skip. A
-      // predicted deny or allow is the harness's to enforce: skip with NO
-      // runtime/classifier calls.
+      // Step 2 — predict the permission outcome BOTH ways core will assert
+      // it. The shell set: one resource per segment under `shell`
+      // (core's aggregated decision, permission.ts:173-189 — any resource
+      // denied → deny; else any ask). The set that runs BEFORE it:
+      // `authorizeExternal` (file-access.ts:125-142) under action
+      // `external_directory` for every cwd-set segment's directory,
+      // resolved ABSOLUTE against the same session cwd the wrap is scoped
+      // to (mirrors index.js's sessionCwd()). A wrap suppresses the
+      // external assert entirely (the wrapped command's scan sees only
+      // the sandbox runner: no directories), so the prediction must
+      // mirror it here. Aggregation mirrors core's ANY-deny/ANY-ask across
+      // both: ANY deny → skip (core denies the invocation on either
+      // action, before anything prompts); ALL allow → skip (the command
+      // runs exactly as the user's rules configured); ANY ask → the
+      // eligibility chain. No runtime or classifier call on the first
+      // two outcomes.
       const loaded = await ruleLoader.loadRules(raw.ctx, raw.sessionID, raw.agentID)
       if (loaded?.ok !== true) return { kind: "skip" }
-      const predicted = predictPermission({ rules: loaded.rules, action: "shell", command })
-      if (predicted !== "ask") return { kind: "skip" }
+      const base =
+        typeof raw.ctx?.location?.directory === "string" && raw.ctx.location.directory !== ""
+          ? raw.ctx.location.directory
+          : process.cwd()
+      let denied = false
+      let asked = false
+      for (const segment of segments) {
+        const effect = predictPermission({ rules: loaded.rules, action: "shell", command: segment })
+        if (effect === "deny") {
+          denied = true
+          break
+        }
+        if (effect === "ask") asked = true
+      }
+      if (!denied) {
+        directories: for (const segment of segments) {
+          if (!isCwdCommand(segment)) continue
+          // A `$`/backtick argument is already dropped inside
+          // directoryArgs (mirrored core drop: no assert, no prediction).
+          for (const arg of directoryArgs(segment)) {
+            const resolved = path.resolve(base, resolveDirectory(arg))
+            // The resource form core ACTUALLY asserts for an external
+            // directory is the resolved path joined with "/*"
+            // (file-access.ts:117 — `resource: slash(path.join(directory,
+            // "*"))`) — NOT the bare path (a `/tmp/**` deny matches the
+            // asserted `/*` form; the bare `/tmp` would predict ask again).
+            const effect = predictPermission({
+              rules: loaded.rules,
+              action: "external_directory",
+              command: path.join(resolved, "*"),
+            })
+            if (effect === "deny") {
+              denied = true
+              break directories
+            }
+            if (effect === "ask") asked = true
+          }
+        }
+      }
+      if (denied) return { kind: "skip" }
+      if (!asked) return { kind: "skip" }
 
       // Step 3 — availability (memoized in the runtime: the first
       // eligible command pays the self-test once, initializing the
@@ -473,6 +653,7 @@ export function createGate(deps) {
       // Step 4 — exclusions and self-sandboxing.
       if (matchesExcludedCommand(command, options.excludedCommands)) return { kind: "skip" }
       if (isSrtInvocation(command)) return { kind: "skip" }
+      if (isUnsandboxedInvocation(command)) return { kind: "skip" }
 
       // Step 5 — failure memory (the unsandboxed-retry escape hatch) and
       // the lifetime attempt cap. Before the classifier: a sandbox-burned

@@ -7,6 +7,8 @@ const base: Permission = { id: "p1", type: "bash", sessionID: "s1", messageID: "
 
 test("kindOf maps known types and MCP tools", () => {
   expect(kindOf("bash")).toBe("bash")
+  // OpenCode v2 renamed the shell tool's permission action to "shell".
+  expect(kindOf("shell")).toBe("bash")
   expect(kindOf("external_directory")).toBe("external_directory")
   expect(kindOf("playwright__browser_navigate")).toBe("mcp")
   expect(kindOf("doom_loop")).toBeUndefined()

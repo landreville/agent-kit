@@ -18,10 +18,13 @@
  *     both match; no match → `"ask"`).
  *   - `predictPermission` collapses `evaluateInput`'s decision
  *     (`permission.ts:173-189`: any resource denied → deny, else any ask
- *     → ask, else allow) to the SINGLE resource a simple command
- *     evaluates to — probe-verified: a simple command's evaluate
- *     resources are exactly `[command]`, which is also why v2's scope is
- *     simple commands only.
+ *     → ask, else allow) to one resource per SEGMENT of the command — a
+ *     simple command's evaluate resources are exactly `[command]`
+ *     (probe-verified), and a compound command is predicted over every
+ *     segment segments.js emits (see policy.js step 1); predicting deny
+ *     on any segment is enough to skip, predicting ask on any is enough
+ *     to consider wrapping. v2 is no longer simple-commands-only: compound
+ *     commands are supported whenever the segmenter accepts the shape.
  *   - `loadRules` mirrors `configured` (`permission.ts:158-163`): agent
  *     rules first, session rules appended (`merge` = flatten,
  *     `permission.ts:99-101`) — last match wins, so session rules

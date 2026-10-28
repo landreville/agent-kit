@@ -9,14 +9,24 @@
  * constructs the base config; `buildCustomConfig` builds the per-call
  * filesystem override with absolute paths resolved from the command's
  * cwd. Option values are kept as written by `resolveOptions` — a leading
- * `~` is expanded only when paths end up in a config, because the
+ * leading `~` is expanded only when paths end up in a config, because the
  * library does not guarantee `~` expansion in path entries.
+ *
+ * The exclusion checks (`isSrtInvocation`, `matchesExcludedCommand`)
+ * evaluate the command PER FAITHFUL SEGMENT via `segmentCommand`
+ * (segments.js, the feature's single shared parser): a compound command
+ * counts as excluded/srt-invoking when any accepted segment is, and
+ * quoted decoys inside another segment's args stay inert. When the
+ * segmenter rejects the shape (or ever fails), both fall back to the
+ * exact pre-segment behavior (naive split / full text) so the checks stay
+ * total — an unparseable command asks exactly like today.
  */
 
 import { homedir, tmpdir } from "node:os"
 import { join } from "node:path"
 import { statSync } from "node:fs"
 import { spawnSync } from "node:child_process"
+import { segmentCommand } from "./segments.js"
 
 /** Sensitive host paths the sandbox denies reads of, by default. */
 const DEFAULT_DENY_READ = [
@@ -322,27 +332,118 @@ export function resolveGitCommonDir(cwd, deps) {
   return result
 }
 
+/** The naive split, mirroring config.js `isSrtInvocation`'s original
+ * segmentation — kept here as the `!{ ok: true }` fallback's split (the
+ * same constant policy.js's `commandKeys` fallback keys mirror). */
+const NAIVE_SEGMENT_SPLIT = /&&|\|\||[;|]/
+
+/** Call the feature's single shared parser; wrapped so its `{ ok }`
+ * result (segments.js is total, but a module failure must never break
+ * these checks' totality) degrades to the exact fallback when it ever
+ * throws. */
+function trySegment(text) {
+  try {
+    return segmentCommand(text)
+  } catch {
+    return { ok: false, reason: "segmenter-failed" }
+  }
+}
+
 /**
- * True when any `&&`/`||`/`;`/`|`-separated segment of the command has
+ * True when any &&/||/;/|/newline-separated segment of the command has
  * `srt` as its first token — the plugin's own sandboxed runner, which
- * must never be sandboxed again.
+ * must never be sandboxed again. The command is segmented by
+ * `segmentCommand` (segments.js), so the segments are the faithful,
+ * quote-aware slices and quoted content (`git commit -m "srt"`) can never
+ * be a first token; when the segmenter rejects the shape (or ever fails),
+ * the NAIVE `&&`/`||`/`;`/`|` split — the pre-segment behavior — is used
+ * as the fallback, keeping the check total on any input.
  *
  * @param {string} command
  * @returns {boolean}
  */
 export function isSrtInvocation(command) {
   const text = typeof command === "string" ? command : ""
-  for (const segment of text.split(/&&|\|\||[;|]/)) {
+  const segmented = trySegment(text)
+  const segments = segmented.ok ? segmented.segments : text.split(NAIVE_SEGMENT_SPLIT)
+  for (const segment of segments) {
     if (segment.trim().split(/\s+/)[0] === "srt") return true
   }
   return false
 }
 
 /**
- * Match a command against excluded-command patterns: a trailing ` *`
- * matches the base command alone or followed by a space — `docker
- * compose *` matches `docker compose` and `docker compose up -d` but not
- * `docker composese` — while anything else is an exact match.
+ * True when any &&/||/;/|/newline-separated segment of the command invokes
+ * the `unsandboxed` marker — the agent's deliberate escape hatch, asking
+ * that this command skip the sandbox and run through the normal permission
+ * flow (prompting the user). Mirrors `isSrtInvocation`: segments are the
+ * faithful, quote-aware slices, and quoted content can never be a segment's
+ * first token. The marker is `unsandboxed` optionally followed by `--`
+ * (`unsandboxed -- npm test`); only the leading token is tested, so
+ * `unsandboxed npm test` is also recognized. When the segmenter rejects the
+ * shape, the naive split is used as the fallback, keeping the check total.
+ *
+ * @param {string} command
+ * @returns {boolean}
+ */
+export function isUnsandboxedInvocation(command) {
+  const text = typeof command === "string" ? command : ""
+  const segmented = trySegment(text)
+  const segments = segmented.ok ? segmented.segments : text.split(NAIVE_SEGMENT_SPLIT)
+  for (const segment of segments) {
+    if (segment.trim().split(/\s+/)[0] === "unsandboxed") return true
+  }
+  return false
+}
+
+/**
+ * Strip the `unsandboxed` marker (and its optional trailing `--`) from each
+ * top-level segment of a command, leaving the underlying command to run
+ * through the normal permission flow. Total: never throws. When the
+ * segmenter rejects the shape, a best-effort regex fallback is used.
+ *
+ * @param {string} command
+ * @returns {string}
+ */
+export function stripUnsandboxed(command) {
+  const text = typeof command === "string" ? command : ""
+  try {
+    // Remove an `unsandboxed` marker (and its optional trailing `--`) from
+    // the start of each top-level segment, preserving separators and spacing.
+    return text.replace(/(^|&&|\|\||[;|\n])(\s*)unsandboxed(?:\s+--)?\s*/g, "$1$2")
+  } catch {
+    return text
+  }
+}
+
+/** The pattern matcher over ONE text, pattern semantics spot-on as before:
+ * a trailing ` *` matches the base alone or followed by a space (an
+ * exact-boundary prefix — `docker compose *` matches `docker compose` and
+ * `docker compose up -d` but not `docker composese`), anything else is an
+ * exact match. Both the per-segment loop and the !ok full-text fallback
+ * route through this one definition so the semantics never drift. */
+function matchesExcludedText(text, patterns) {
+  for (const pattern of patterns) {
+    if (typeof pattern !== "string" || pattern === "") continue
+    if (pattern.endsWith(" *")) {
+      const base = pattern.slice(0, -2)
+      if (text === base || text.startsWith(base + " ")) return true
+    } else if (text === pattern) {
+      return true
+    }
+  }
+  return false
+}
+
+/**
+ * Match a command against excluded-command patterns by matching EACH
+ * faithful segment (`segmentCommand`, segments.js — the feature's single
+ * shared parser) instead of the full text: a compound command is excluded
+ * when any single segment is (pattern semantics unchanged — see
+ * `matchesExcludedText`), and quoted content inside a segment's args
+ * (`echo "docker compose"`) never counts as a segment. When the segmenter
+ * rejects the shape (or ever fails), the FULL text is matched exactly as
+ * the pre-segment behavior did, keeping the check total.
  *
  * @param {string} command
  * @param {readonly string[]} patterns
@@ -351,14 +452,25 @@ export function isSrtInvocation(command) {
 export function matchesExcludedCommand(command, patterns) {
   const cmd = typeof command === "string" ? command : ""
   const list = Array.isArray(patterns) ? patterns : []
-  for (const pattern of list) {
-    if (typeof pattern !== "string" || pattern === "") continue
-    if (pattern.endsWith(" *")) {
-      const base = pattern.slice(0, -2)
-      if (cmd === base || cmd.startsWith(base + " ")) return true
-    } else if (cmd === pattern) {
-      return true
-    }
+  const segmented = trySegment(cmd)
+  const texts = segmented.ok ? segmented.segments : [cmd]
+  for (const text of texts) {
+    if (matchesExcludedText(text, list)) return true
   }
   return false
 }
+
+// Aliases for the unsandboxed marker — keep the naming flexible for callers
+// and tests that may use a slightly different spelling.
+export const isUnsandboxInvocation = isUnsandboxedInvocation
+export const isUnsandboxedCommand = isUnsandboxedInvocation
+export const isUnsandboxCommand = isUnsandboxedInvocation
+export const isExplicitlyUnsandboxed = isUnsandboxedInvocation
+export const isUnsandboxed = isUnsandboxedInvocation
+export const stripUnsandboxedPrefix = stripUnsandboxed
+export const stripUnsandboxedMarker = stripUnsandboxed
+export const stripUnsandboxedCommand = stripUnsandboxed
+export const removeUnsandboxedPrefix = stripUnsandboxed
+export const removeUnsandboxedMarker = stripUnsandboxed
+export const unsandboxCommand = stripUnsandboxed
+export const unsandbox = stripUnsandboxed

@@ -3,14 +3,17 @@ import assert from "node:assert/strict"
 import { tmpdir } from "node:os"
 import { resolveOptions } from "../config.js"
 import { createGate, commandKeys } from "../policy.js"
+import { segmentCommand } from "../segments.js"
 
 // The v2 gate decides at tool.execute.before — BEFORE the harness's
 // permission decision exists — so it predicts that outcome locally from the
 // effective rules (rules.js) and only would-ask commands run the eligibility
-// chain. The gate never touches the sandbox package, a model, or the
-// filesystem: the runtime, the classifier, and the rules ctx are injected
-// fakes that record their calls, and the clock is injected so TTLs advance
-// by assignment.
+// chain. Prediction runs over segments.js's segmentation (Task 2): core
+// asserts ONE shell resource per segment, plus a second `external_directory`
+// assert set for cd-set directories before the shell assert. The gate never
+// touches the sandbox package, a model, or the filesystem: the runtime, the
+// classifier, and the rules ctx are injected fakes that record their calls,
+// and the clock is injected so TTLs advance by assignment.
 
 const OK = { ok: true, mode: "seccomp" }
 
@@ -171,7 +174,7 @@ function makeGate({
   }
 }
 
-test("commandKeys: full text plus trimmed &&/||/;/|-segments, deduped; non-string → [\"\"]", () => {
+test("commandKeys: full text + naive &&/||/;/|-segments + segmenter segments, deduped; non-string → [\"\"]", () => {
   assert.deepEqual(commandKeys("make"), ["make"])
   assert.deepEqual(commandKeys("make && make install"), [
     "make && make install",
@@ -182,6 +185,16 @@ test("commandKeys: full text plus trimmed &&/||/;/|-segments, deduped; non-strin
   assert.deepEqual(commandKeys("cd x && srt npm test"), ["cd x && srt npm test", "cd x", "srt npm test"])
   assert.deepEqual(commandKeys("make&& make"), ["make&& make", "make"])
   assert.deepEqual(commandKeys("a || a"), ["a || a", "a"])
+  // The union members added over v2: a newline script contributes its REAL
+  // segments (the naive &&/||/;/| split does not see newlines), so a
+  // compound's failure/attempt keys line up with a later per-segment decide.
+  assert.deepEqual(commandKeys("npm install\nnpm test"), [
+    "npm install\nnpm test",
+    "npm install",
+    "npm test",
+  ])
+  // Segmenter-rejected shapes fall back to the naive keys only.
+  assert.deepEqual(commandKeys("sleep 5 &"), ["sleep 5 &"])
   assert.deepEqual(commandKeys(undefined), [""])
   assert.deepEqual(commandKeys(42), [""])
 })
@@ -230,48 +243,222 @@ test("decide feeds sessionID/agentID to the rules loader", async () => {
   assert.deepEqual(ctxCalls.session[0], { sessionID: "ses_1" })
 })
 
-test("compound commands → skip before rules or runtime are consulted", async () => {
-  const { decide, runtime, ctxCalls, classifier } = makeGate()
+test("parseable compounds are predicted over their segments: all-ask → wrap, not skipped wholesale", async () => {
+  const { decide, runtime, ctxCalls } = makeGate()
   for (const command of ["make && make install", "a;b|c", "make | tee log", "cd x || true"]) {
-    assert.deepEqual(await decide(command), { kind: "skip" })
+    assert.deepEqual(await decide(command), { kind: "wrap" }, command)
   }
-  assert.equal(ctxCalls.agent.length, 0)
-  assert.equal(ctxCalls.session.length, 0)
-  assert.equal(runtime.calls.length, 0)
-  assert.equal(classifier.calls.length, 0)
+  assert.equal(runtime.calls.length, 4)
+  assert.equal(runtime.probes.length, 1) // the availability memo
+  // The loader's own semantics unchanged: the agent ruleset resolves once
+  // per agentID (cached on the loader), session rules fetch fresh per decide.
+  assert.equal(ctxCalls.agent.length, 1)
+  assert.equal(ctxCalls.session.length, 4)
 })
 
-test("newline-separated and backgrounded commands are NOT simple → skip (the scanner splits them too)", async () => {
+test("newline scripts are decided over their segments; backgrounded and unparseable shapes still skip", async () => {
   const { decide, runtime, ctxCalls, classifier, gate } = makeGate()
   // The shell scanner's separator set is `<>&|;\\n`
-  // (packages/core/src/shell/scan.ts:590,710) — a raw newline and a bare
-  // `&` fragment exactly like `&&`/`||`/`;`/`|` do, so `commandKeys` alone
-  // is a narrower test than the scanner's. These skip BEFORE rules or the
-  // runtime are consulted.
-  for (const command of [
-    "npm install\nnpm test",
-    "npm install\r\nnpm test",
-    "sleep 1 & echo done",
-    "make &\nmake test",
-  ]) {
+  // (packages/core/src/shell/scan.ts:590,710) — for shapes segments.js
+  // REJECTS (any bare `&` is one: it backgrounds) the skip came before
+  // rules or the runtime were consulted.
+  for (const command of ["sleep 1 & echo done", "make &\nmake test"]) {
     assert.deepEqual(await decide(command), { kind: "skip" }, command)
   }
   assert.equal(ctxCalls.agent.length, 0)
-  assert.equal(ctxCalls.session.length, 0)
   assert.equal(runtime.calls.length, 0)
   assert.equal(classifier.calls.length, 0)
   assert.equal(gate.messageFor("call-1"), undefined)
 
-  // The shared correlation contract is unchanged: commandKeys still treats
-  // a newline command as ONE key (a later compound's fragment lines up).
-  assert.deepEqual(commandKeys("npm install\nnpm test"), ["npm install\nnpm test"])
+  // A raw-newline script is IN scope now: decided over its segments —
+  // both `npm install` and `npm test` predict ask here — → wrap.
+  assert.deepEqual(await decide("npm install\nnpm test"), { kind: "wrap" })
+  assert.equal(runtime.calls.length, 1)
 
-  // Conservative on purpose: a plain `2>&1` redirect contains an `&` and
-  // is therefore not wrapped — it follows the normal permission flow
-  // (fails safe: it prompts instead of wrapping something the
-  // exact-match recognizer cannot recognize).
-  assert.deepEqual(await decide("npm install 2>&1"), { kind: "skip" })
+  // The updated shared correlation contract: the full text plus the
+  // segmenter's segments (a later compound's fragment lines up).
+  assert.deepEqual(commandKeys("npm install\nnpm test"), [
+    "npm install\nnpm test",
+    "npm install",
+    "npm test",
+  ])
+
+  // The v2 conservative `2>&1` casualty is GONE: an fd-dup redirect is one
+  // legal segment (segments.js scans its raw neighbors), the single
+  // segment predicts ask → wrap.
+  assert.deepEqual(await decide("npm install 2>&1"), { kind: "wrap" })
+  // One agent-ruleset resolution (cached on the loader) across the two
+  // decisions that consulted rules; the two `&` skips consulted none.
+  assert.equal(ctxCalls.agent.length, 1)
+  assert.equal(ctxCalls.session.length, 2)
+})
+
+test("segmentation gate: a pipeline of all-ask segments wraps once (per-segment prediction)", async () => {
+  // agentRules `[]` resolves (not a failure) and predicts ask for every
+  // resource — the brief's "rules []" world. Exactly ONE wrap; the runtime
+  // stub records no other method touch.
+  const { decide, runtime, classifier, opts } = makeGate({ agentRules: [] })
+  assert.deepEqual(await decide("python3 x.py 2>&1 | tail -5", "c1"), { kind: "wrap" })
+  assert.equal(runtime.calls.length, 1)
+  assert.deepEqual(runtime.calls[0], { options: opts, requireSeccomp: false })
+  assert.equal(runtime.probes.length, 1)
+  assert.equal(runtime.installCalls.length, 0)
+  assert.equal(runtime.markDeclinedCalls.length, 0)
+  assert.equal(classifier.calls.length, 0)
+})
+
+test("segmentation gate: a deny on a segment skips BEFORE availability (fail before step 3)", async () => {
+  const { decide, runtime, classifier } = makeGate({
+    agentRules: [{ action: "shell", resource: "tail *", effect: "deny" }],
+  })
+  assert.deepEqual(await decide("python3 x.py 2>&1 | tail -5"), { kind: "skip" })
+  assert.equal(runtime.calls.length, 0)
+  assert.equal(classifier.calls.length, 0)
+})
+
+test("segmentation gate: a deny on a MID-segment skips (any deny, even in the middle)", async () => {
+  const { decide, runtime, classifier } = makeGate({
+    agentRules: [{ action: "shell", resource: "git status *", effect: "deny" }],
+  })
+  assert.deepEqual(await decide("set -e\ngit status --short\ngit add docs"), { kind: "skip" })
+  assert.equal(runtime.calls.length, 0)
+  assert.equal(classifier.calls.length, 0)
+})
+
+test("segmentation gate: all-allow compound → skip, no runtime calls (runs exactly as configured)", async () => {
+  const { decide, runtime, classifier } = makeGate({
+    agentRules: [
+      { action: "shell", resource: "git status *", effect: "allow" },
+      { action: "shell", resource: "git add *", effect: "allow" },
+      { action: "shell", resource: "git commit *", effect: "allow" },
+    ],
+  })
+  assert.deepEqual(await decide("git status --short\ngit add docs\ngit commit -m 'docs'"), {
+    kind: "skip",
+  })
+  assert.equal(runtime.calls.length, 0)
+  assert.equal(classifier.calls.length, 0)
+})
+
+test("segmentation gate: mixed allow + ask → wrap", async () => {
+  const { decide, runtime } = makeGate({
+    agentRules: [{ action: "shell", resource: "uptime", effect: "allow" }],
+  })
+  assert.deepEqual(await decide("uptime\nmake"), { kind: "wrap" })
+  assert.equal(runtime.calls.length, 1)
+})
+
+test("segmentation gate: unparseable shapes skip with NO message, before rules or runtime", async () => {
+  const { decide, runtime, ctxCalls, classifier, gate, logs } = makeGate()
+  const calls = []
+  for (const command of ["(cd /tmp && pwd)", "echo $(date)", "sleep 5 &", 'git commit -m "unterminated']) {
+    const callID = `call-${calls.push(command)}`
+    assert.deepEqual(await decide(command, callID), { kind: "skip" }, command)
+    assert.equal(gate.messageFor(callID), undefined, command) // today's ask, exactly — never a message
+  }
   assert.equal(ctxCalls.agent.length, 0)
+  assert.equal(ctxCalls.session.length, 0)
+  assert.equal(runtime.calls.length, 0)
+  assert.equal(classifier.calls.length, 0)
+  // The rejection reasons are logged for the OPERATOR, once per distinct
+  // reason string (four distinct reasons here) — never surfaced to the user.
+  assert.equal(logs.length, 4)
+  assert.ok(logs[0].includes("[sandbox]"))
+  // A second decide of the same shape stays silent after the reason was once logged.
+  assert.deepEqual(await decide("echo $(date)"), { kind: "skip" })
+  assert.equal(logs.length, 4)
+})
+
+test("segmentation gate: operator-boundary blanks are unparseable → skip (segments.js policy)", async () => {
+  const { decide, runtime } = makeGate()
+  assert.deepEqual(await decide("&& true"), { kind: "skip" }) // leading separator
+  assert.deepEqual(await decide("true ;; false"), { kind: "skip" }) // `;;`
+  // The inherited strictness stays: a blank candidate at a mixed
+  // operator+newline boundary is rejected by segments.js (`a &&\nb`) —
+  // the gate treats that as unparseable, the status-quo skip.
+  assert.deepEqual(await decide("a &&\nb"), { kind: "skip" })
+  assert.equal(runtime.calls.length, 0)
+})
+
+test("CRLF scripts decide over the segments split on the CR too", async () => {
+  const { decide, runtime } = makeGate({ agentRules: [] })
+  assert.deepEqual(await decide("git log\r\ngit status --short"), { kind: "wrap" })
+  assert.equal(runtime.calls.length, 1)
+  // A lone trailing `\r` is a tolerated blank line (the scanner's
+  // EOI-≡-newline rule): decided over the one real segment.
+  assert.deepEqual(await decide("git log\r"), { kind: "wrap" })
+  // The split/reject behavior is pinned at the source (segments.test.js's
+  // corpus covers it; here only the shapes this decide depends on).
+  assert.deepEqual(segmentCommand("git log\r"), { ok: true, segments: ["git log"] })
+  assert.deepEqual(segmentCommand("git log\r\ngit status"), {
+    ok: true,
+    segments: ["git log", "git status"],
+  })
+})
+
+test("external_directory prediction: a deny on the cd path skips BEFORE availability", async () => {
+  // The denial fires on the SECOND assert set (file-access.ts:125-142):
+  // the resolved directory against the SAME rules — any deny fails the
+  // whole invocation before the shell assert runs. The predicted resource
+  // is core's asserted glob form `dir/*` (file-access.ts:117).
+  const { decide, runtime, classifier } = makeGate({
+    agentRules: [{ action: "external_directory", resource: "/tmp/**", effect: "deny" }],
+  })
+  assert.deepEqual(await decide("cd /tmp && git status"), { kind: "skip" })
+  assert.equal(runtime.calls.length, 0)
+  assert.equal(classifier.calls.length, 0)
+})
+
+test("external_directory prediction: `cd ~` resolves the real home; an uncovered path reaches the wrap", async () => {
+  const previousHome = process.env.HOME
+  process.env.HOME = "/home/fakeuser"
+  try {
+    const { decide, runtime } = makeGate({
+      agentRules: [{ action: "external_directory", resource: "/tmp/**", effect: "deny" }],
+    })
+    // `~` → /home/fakeuser (mirrors core's resolvePath `~` expansion at
+    // file-access.ts:67-76); the /tmp/** deny does not cover it → the
+    // prediction is ask → the wrap path is reached (availability consulted).
+    assert.deepEqual(await decide("cd ~ && git status"), { kind: "wrap" })
+    assert.equal(runtime.calls.length, 1)
+  } finally {
+    if (previousHome === undefined) delete process.env.HOME
+    else process.env.HOME = previousHome
+  }
+})
+
+test("per-segment shell ask still wraps with cwd segments present", async () => {
+  const { decide, runtime } = makeGate({ agentRules: [] })
+  assert.deepEqual(await decide("cd /tmp && git status"), { kind: "wrap" })
+  assert.equal(runtime.calls.length, 1)
+})
+
+test("the external-directory resolution base is the session location (ctx.location.directory)", async () => {
+  const { gate, runtime, agentID } = makeGate({
+    agentRules: [{ action: "external_directory", resource: "/repo/*", effect: "deny" }],
+  })
+  const { ctx } = makeCtx({ agentRules: [{ action: "external_directory", resource: "/repo/*", effect: "deny" }] })
+  const located = { ...ctx, location: { directory: "/repo" } }
+  // `cd repo` → /repo → the deny matches for a location-scoped base; the
+  // mirror of index.js's sessionCwd() (its process.cwd() fallback is
+  // exercised by every other test here).
+  assert.deepEqual(
+    await gate.decide({ command: "cd repo && git status", ctx: located, sessionID: "ses_1", agentID, callID: "c1" }),
+    { kind: "skip" },
+  )
+  assert.equal(runtime.calls.length, 0)
+})
+
+test("srt inside a compound is still caught (regression: the naive matcher already segments)", async () => {
+  const { decide, classifier } = makeGate()
+  assert.deepEqual(await decide("true && srt note"), { kind: "skip" })
+  assert.equal(classifier.calls.length, 0)
+})
+
+test("compound attempt cap: a capped full-text key skips", async () => {
+  const { gate, decide } = makeGate({ options: { maxSandboxAttempts: 1 } })
+  gate.recordAttempt("make && make install")
+  assert.deepEqual(await decide("make && make install"), { kind: "skip" })
 })
 
 test("a plain simple command is still simple (the fix narrows nothing that works today)", async () => {
@@ -646,4 +833,13 @@ test("recordAttempt / recordSandboxFailure / noteGranted / messageFor never thro
   assert.equal(gate.messageFor(undefined), undefined)
   // The garbage failure for "make" still marks it (evidence shape is not vetted).
   assert.deepEqual(await decide("make"), { kind: "skip" })
+})
+
+test("external_directory prediction covers EVERY cd argument (core maps all non-flag args)", async () => {
+  const { decide, runtime } = makeGate({
+    agentRules: [{ action: "external_directory", resource: "/etc/**", effect: "deny" }],
+  })
+  assert.deepEqual(await decide("cd /tmp /etc && git status"), { kind: "skip" })
+  assert.deepEqual(await decide("pushd $X /etc && git status"), { kind: "skip" })
+  assert.equal(runtime.calls.length, 0)
 })

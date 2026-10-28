@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test"
-import { judgeTier, parseVerdict } from "../src/tiers/judge"
+import { judgeTier, parseVerdict, callJudge } from "../src/tiers/judge"
 import { renderUserPrompt, SYSTEM_PROMPT } from "../src/prompt"
 import { DEFAULTS } from "../src/config"
 import type { ActionRequest, SessionContext, TierEnv } from "../src/types"
@@ -21,6 +21,22 @@ test("prompt contains user messages, intent, action, and signals", () => {
   expect(p).toContain("npm test")
   expect(p).toContain("injection_driven")
   expect(SYSTEM_PROMPT).toContain("ask")
+})
+
+test("judge request honours the configured max_tokens budget", async () => {
+  // glm-5.3-flash is a reasoning model: its 200-token budget used to be
+  // consumed entirely by reasoning_content, leaving content empty
+  // ("judge: no content"). The budget is now config-driven.
+  let captured: any
+  const fetchCapture: typeof fetch = (async (_url: any, init: any) => {
+    captured = JSON.parse(init.body)
+    return new Response(JSON.stringify(completion('{"verdict":"ask","reason":"unsure","session_pattern":null}')), { status: 200, headers: { "content-type": "application/json" } })
+  }) as any
+  const cfg = { ...DEFAULTS.judge, apiKey: "k", baseUrl: "https://judge.test/v1" }
+  await callJudge({ cfg, model: cfg.model, system: "s", user: "u", fetchImpl: fetchCapture })
+  expect(captured.max_tokens).toBe(DEFAULTS.judge.maxTokens)
+  await callJudge({ cfg: { ...cfg, maxTokens: 4000 }, model: cfg.model, system: "s", user: "u", fetchImpl: fetchCapture })
+  expect(captured.max_tokens).toBe(4000)
 })
 
 test("parseVerdict accepts fenced JSON and rejects junk", () => {

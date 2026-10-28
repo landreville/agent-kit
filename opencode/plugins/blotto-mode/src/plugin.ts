@@ -2,6 +2,7 @@ import type { Plugin } from "@opencode-ai/plugin"
 import type { Permission } from "@opencode-ai/sdk"
 import { homedir as osHomedir } from "node:os"
 import { basename } from "node:path"
+import { existsSync } from "node:fs"
 import { loadConfig, type Config } from "./config"
 import { normalize } from "./request"
 import { activeRules, rulesTier } from "./rules/engine"
@@ -41,6 +42,10 @@ export function createPlugin(deps: {
   onDecision?: (req: ActionRequest, result: PipelineResult) => void
   /** Plugin diagnostics sink (default: client.app.log). */
   logger?: Logger
+  /** Shared runtime state (session overrides + counters); created if omitted. */
+  state?: RuntimeState
+  /** Called when the startup Laya probe settles (true/false). */
+  onLayaReachable?: (reachable: boolean) => void
 } = {}): Plugin {
   return async ({ client, project, directory, worktree }) => {
     const homedir = deps.homedir ?? osHomedir()
@@ -54,7 +59,7 @@ export function createPlugin(deps: {
     const log = deps.log ?? new DecisionLog({ path: cfg.log.path, maxMb: cfg.log.maxMb, onError: (m) => plog("error", m) })
     const rules = activeRules(cfg)
     const cache = new SessionCache({ rules, homedir, sessionPatterns: cfg.cache.sessionPatterns })
-    const state = new RuntimeState()
+    const state = deps.state ?? new RuntimeState()
     const inflight = new InFlight()
     const projectName = basename(project.worktree || worktree)
 
@@ -64,9 +69,12 @@ export function createPlugin(deps: {
     let layaProbe: Promise<boolean> = Promise.resolve(false)
     if (cfg.laya.mode !== "off" && cfg.laya.baseUrl) {
       layaProbe = probeLaya(cfg.laya, fetchImpl).then(
-        (ok) => { layaReachable = ok; if (!ok) plog("warn", `laya endpoint ${cfg.laya.baseUrl} unreachable; tier will be skipped`); return ok },
-        () => { plog("warn", `laya endpoint ${cfg.laya.baseUrl} unreachable; tier will be skipped`); return false },
+        (ok) => { layaReachable = ok; deps.onLayaReachable?.(ok); if (!ok) plog("warn", `laya endpoint ${cfg.laya.baseUrl} unreachable; tier will be skipped`); return ok },
+        () => { layaReachable = false; deps.onLayaReachable?.(false); plog("warn", `laya endpoint ${cfg.laya.baseUrl} unreachable; tier will be skipped`); return false },
       )
+    } else {
+      // No probe will run; report the initial (unreachable) state so v2's flag stays consistent.
+      deps.onLayaReachable?.(false)
     }
 
     const allTiers: { name: TierName; run: Tier; failClosed?: boolean }[] = [
@@ -109,17 +117,37 @@ export function createPlugin(deps: {
       },
       event: async ({ event }) => {
         try {
+          // Null/garbled properties are normal on forwarded v2 events; treat
+          // everything but the exact shapes we use as pass-through.
           if (event.type === "permission.replied") {
-            const { permissionID, sessionID, response } = event.properties
-            if (log.has(permissionID)) log.append({ kind: "reply", ts: now().toISOString(), permissionID, sessionID, response })
+            const props = (event.properties ?? {}) as { permissionID?: string; sessionID?: string; response?: string }
+            if (typeof props.permissionID !== "string") return
+            if (log.has(props.permissionID)) log.append({ kind: "reply", ts: now().toISOString(), permissionID: props.permissionID, sessionID: props.sessionID ?? "", response: props.response ?? "" })
           } else if (event.type === "session.deleted") {
-            const id = event.properties.info.id
+            const id = (event.properties as { info?: { id?: string } } | null)?.info?.id
+            if (typeof id !== "string") return
             cache.dropSession(id); state.dropSession(id)
           }
         } catch (e) { plog("error", `event handler failed: ${String(e)}`) }
       },
       tool: {
-        blotto_mode: blottoModeTool(state, () => ({ enabled: cfg.enabled, layaMode: cfg.laya.mode, layaReachable, judgeModel: cfg.judge.model })),
+        blotto_mode: blottoModeTool(state, () => ({ enabled: cfg.enabled, layaMode: cfg.laya.mode, layaReachable, judgeModel: cfg.judge.model }), {
+          getCfg: () => cfg.laya,
+          fetchImpl,
+          checkPath: (name: string) => {
+            try {
+              const w = (globalThis as any).Bun?.which
+              const found = typeof w === "function" ? (w(name) ?? null) : null
+              if (found) return found
+            } catch { /* */ }
+            const home = (globalThis as any).process?.env?.HOME || ""
+            const candidates = [`${home}/.pyenv/versions/laya/bin/${name}`, `${home}/.local/share/laya-venv/bin/${name}`, `${home}/.local/bin/${name}`]
+            for (const c of candidates) { try { if (existsSync(c)) return c } catch { /* */ } }
+            return null
+          },
+          setReachable: (v: boolean) => { layaReachable = v },
+          probe: (c: any) => probeLaya(c, fetchImpl),
+        }),
       },
     }
   }

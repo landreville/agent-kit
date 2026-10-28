@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "description": "Auto mode for OpenCode v2: intent-aware permission auto-resolution",
   "type": "module",
-  "main": "src/index.ts",
+  "main": "index.ts",
   "license": "MIT",
   "scripts": {
     "test": "bun test",

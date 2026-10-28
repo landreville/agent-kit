@@ -4,9 +4,10 @@ Guidance for agents working on blotto-mode, an "auto mode" plugin for OpenCode v
 
 Read these first:
 
+- `docs/superpowers/specs/2026-09-30-blotto-mode-design.md` (from the agent-kit repo root) is the design spec and the binding authority on behaviour.
 - `README.md` documents user-facing behaviour, config, safety notes and CLI usage. It describes the code as built, so keep it true when you change behaviour.
 - `docs/install.md` has the install steps and the manual acceptance checklist, which has not been run yet.
-- The original design spec and implementation plan are not published with this repo. The code deliberately departs from the plan in many places, listed under "Deliberate departures from the plan" below, so don't "fix" code back to it.
+- `docs/superpowers/plans/2026-09-30-blotto-mode.md` (from the agent-kit repo root) is the original implementation plan. It is historical. The code deliberately departs from it in many places, listed under "Deliberate departures from the plan" below, so don't "fix" code back to the plan.
 
 ## Commands
 
@@ -130,7 +131,7 @@ None of these has been run against live services yet. They are all on the `docs/
 
 ## Deliberate departures from the plan
 
-The code differs from the original plan on purpose. Each departure came from a review finding or the spec, so don't revert them:
+The code differs from the plan (repo root `docs/superpowers/plans/2026-09-30-blotto-mode.md`) on purpose. Each departure came from a review finding or the spec, so don't revert them:
 
 - `pipeToNetwork` uses the spec's field name `sources`, and there is a `downloadToInterpreter` match form instead of a magic string.
 - `curl-pipe-sh` matches on real pipeline position rather than command adjacency. Its download-to-file exemption covers real files only, not `-` or `/dev/stdout`.
